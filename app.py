@@ -2,421 +2,258 @@
 import io
 import os
 import re
-import json
-import hashlib
-from datetime import date, datetime
-from typing import List, Dict, Any, Tuple
+from datetime import date
+from typing import Any
 
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from openai import OpenAI
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
-APP_TITLE = "Dossiê Executivo Imobiliário"
+st.set_page_config(page_title="Dossiê Imobiliário", page_icon="🏢", layout="wide")
 
 MASTER_PROMPT = """
-Você é um analista financeiro, patrimonial e contratual especializado em unidades imobiliárias.
+Crie um Dossiê Executivo de Valorização Patrimonial e Análise Contratual,
+em português do Brasil, usando exclusivamente os documentos enviados,
+o valor atual de tabela e a data-base.
 
-Crie um DOSSIÊ EXECUTIVO COMPLETO DE VALORIZAÇÃO PATRIMONIAL E ANÁLISE CONTRATUAL usando exclusivamente:
-1. os documentos fornecidos;
-2. o valor atual de tabela informado;
-3. a data-base informada.
-
-REGRAS OBRIGATÓRIAS
-- Não presuma informações.
-- Não invente cláusulas, páginas, taxas, índices ou datas.
-- Quando algo não estiver disponível, escreva: "Documento não localizado entre os arquivos analisados." ou "Informação não localizada nos documentos analisados.", conforme o caso.
-- Aplique a hierarquia: aditivo mais recente; aditivos anteriores; contrato original; extrato financeiro; informação do usuário.
-- O aditivo prevalece apenas sobre o que alterar expressamente.
-- Sempre diferencie valor original, valor ajustado, valor corrigido e recebimento líquido.
+Regras:
+- Não invente dados, cláusulas, páginas, índices ou taxas.
+- Informe a origem de cada dado relevante.
+- Aplique a hierarquia: aditivo mais recente, aditivos anteriores,
+  contrato original, extrato financeiro e informação do usuário.
+- O aditivo prevalece somente sobre o que alterar expressamente.
+- Diferencie valor original, valor ajustado, total pago nominal,
+  total pago corrigido, recebimento líquido e saldo devedor.
+- Destaque todas as divergências.
 - Não apresente valorização bruta como lucro líquido.
-- Não omita saldo devedor.
-- Não afirme superioridade sobre o CDI sem cálculo exato.
-- Patrimônio de afetação somente pode ser afirmado se constar expressamente nos documentos.
-- Em temas jurídicos, indique documento, página e cláusula/item quando localizados.
-- Para cada dado relevante, indique a origem.
-- Destaque divergências entre contrato, aditivos e extrato.
-- Não trate o último número de "Par" como quantidade de parcelas pagas; conte os registros por tipo.
-- Caso a série histórica oficial do CDI não tenha sido fornecida ao sistema, escreva exatamente:
-"Simulação de CDI não concluída por ausência da série histórica oficial necessária à capitalização individual dos aportes. Nenhum valor estimado foi inserido."
+- Não afirme patrimônio de afetação sem previsão expressa.
+- Não estime CDI. Sem série oficial, informe que a simulação não foi concluída.
+- Indique cláusula/item e página em temas jurídicos quando localizados.
 
-ESTRUTURA OBRIGATÓRIA
+Estrutura:
 1. Identificação da unidade
 2. Resumo executivo
-3. Documentos analisados e documentos ausentes
-4. Hierarquia documental aplicada
-5. Dados contratuais - condição original
-6. Dados contratuais - condição após aditivos
-7. Alterações efetivas
-8. Conferência financeira
-9. Inconsistências identificadas
-10. Evolução patrimonial
-11. Rentabilidade sobre o contrato
-12. Rentabilidade sobre o capital investido
-13. Multiplicador patrimonial
-14. Patrimônio líquido estimado
-15. Simulação em 100% do CDI
-16. Comparativo imóvel x CDI
-17. Prazo de entrega
-18. Multa por atraso da incorporadora
-19. Inadimplência do adquirente
-20. Patrimônio de afetação
-21. Quadro executivo de rentabilidade
-22. Ranking de performance
-23. Conclusão executiva
-
-FÓRMULAS
-- Valorização sobre o contrato original = valor atual de tabela - valor original do contrato.
-- Valorização sobre valor ajustado = valor atual de tabela - valor contratual ajustado.
-- Rentabilidade sobre o contrato = valorização / valor contratual de referência x 100.
-- Rentabilidade sobre o capital investido = valorização / recebimento líquido x 100.
-- Multiplicador patrimonial = valor atual de tabela / recebimento líquido.
-- Patrimônio líquido estimado = valor atual de tabela - saldo devedor total atualizado.
-- Ganho econômico líquido estimado = patrimônio líquido estimado - recebimento líquido.
-
-CLASSIFICAÇÃO
-- Resultado negativo: Baixo Desempenho
-- Até 30%: Regular
-- Acima de 30% até 60%: Bom
-- Acima de 60% até 100%: Muito Bom
-- Acima de 100%: Excelente
-
-FORMATAÇÃO
-- Escreva em português do Brasil.
-- Use títulos e subtítulos claros.
-- Use tabelas em Markdown quando isso melhorar a leitura.
-- Linguagem técnica, persuasiva, responsável e adequada para diretoria, cliente, jurídico, comercial e financeiro.
+3. Documentos analisados e ausentes
+4. Dados contratuais originais
+5. Alterações por aditivos
+6. Conferência financeira
+7. Inconsistências
+8. Evolução patrimonial
+9. Rentabilidades
+10. Multiplicador patrimonial
+11. Patrimônio líquido estimado
+12. CDI e comparativo
+13. Prazo de entrega
+14. Multa por atraso
+15. Inadimplência do adquirente
+16. Patrimônio de afetação
+17. Quadro executivo
+18. Ranking
+19. Conclusão executiva
 """
 
-def clean_text(text: str) -> str:
+def clean(text: str) -> str:
     text = text.replace("\x00", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-def extract_pdf(file_bytes: bytes) -> Tuple[str, int]:
-    reader = PdfReader(io.BytesIO(file_bytes))
+def extract_pdf(raw: bytes) -> tuple[str, int]:
+    reader = PdfReader(io.BytesIO(raw))
     pages = []
-    for idx, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
-        pages.append(f"\n--- PÁGINA {idx} ---\n{page_text}")
-    return clean_text("\n".join(pages)), len(reader.pages)
+    for number, page in enumerate(reader.pages, 1):
+        content = page.extract_text() or ""
+        pages.append(f"\n--- PÁGINA {number} ---\n{content}")
+    return clean("\n".join(pages)), len(reader.pages)
 
-def extract_docx(file_bytes: bytes) -> str:
-    doc = Document(io.BytesIO(file_bytes))
-    parts = []
-    for p in doc.paragraphs:
-        if p.text.strip():
-            parts.append(p.text)
+def extract_docx(raw: bytes) -> str:
+    doc = Document(io.BytesIO(raw))
+    output = [p.text for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
         for row in table.rows:
-            parts.append(" | ".join(cell.text.strip() for cell in row.cells))
-    return clean_text("\n".join(parts))
+            output.append(" | ".join(cell.text.strip() for cell in row.cells))
+    return clean("\n".join(output))
 
-def extract_txt(file_bytes: bytes) -> str:
-    for enc in ("utf-8", "latin-1"):
-        try:
-            return clean_text(file_bytes.decode(enc))
-        except UnicodeDecodeError:
-            pass
-    return ""
-
-def extract_uploaded_file(uploaded) -> Dict[str, Any]:
+def extract_file(uploaded) -> dict[str, Any]:
     raw = uploaded.getvalue()
-    suffix = uploaded.name.lower().rsplit(".", 1)[-1]
-    if suffix == "pdf":
+    ext = uploaded.name.lower().rsplit(".", 1)[-1]
+    pages = None
+    if ext == "pdf":
         text, pages = extract_pdf(raw)
-    elif suffix == "docx":
-        text, pages = extract_docx(raw), None
-    elif suffix in ("txt", "md", "csv"):
-        text, pages = extract_txt(raw), None
+    elif ext == "docx":
+        text = extract_docx(raw)
+    elif ext in {"txt", "md", "csv"}:
+        text = clean(raw.decode("utf-8", errors="ignore"))
     else:
-        text, pages = "", None
-    return {
-        "name": uploaded.name,
-        "size": len(raw),
-        "pages": pages,
-        "text": text,
-        "sha256": hashlib.sha256(raw).hexdigest()
-    }
+        text = ""
+    return {"name": uploaded.name, "pages": pages, "text": text, "chars": len(text)}
 
-def truncate_documents(docs: List[Dict[str, Any]], limit_chars: int = 220000) -> str:
-    blocks = []
-    used = 0
-    for i, doc in enumerate(docs, start=1):
-        header = (
-            f"\n\n===== DOCUMENTO {i}: {doc['name']} =====\n"
-            f"Páginas: {doc.get('pages') or 'não aplicável'}\n"
-            f"SHA-256: {doc['sha256']}\n"
-        )
-        available = max(0, limit_chars - used - len(header))
-        if available <= 0:
-            break
-        body = doc["text"][:available]
-        blocks.append(header + body)
-        used += len(header) + len(body)
-    return "".join(blocks)
+def response_text(response) -> str:
+    direct = getattr(response, "output_text", None)
+    if direct and str(direct).strip():
+        return str(direct).strip()
 
-def call_ai(documents_text: str, table_value: float, base_date: date, notes: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "A variável OPENAI_API_KEY não foi configurada no ambiente de hospedagem."
-        )
-    model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    client = OpenAI(api_key=api_key)
+    parts = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            value = getattr(content, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+            elif value is not None:
+                nested = getattr(value, "value", None)
+                if nested:
+                    parts.append(str(nested))
+    return "\n".join(parts).strip()
 
+def generate_report(doc_text: str, table_value: float, base_date: date, notes: str):
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY não configurada no Render.")
+    if key.lower() in {"sua chave", "sua_chave", "sua_chave_aqui"}:
+        raise RuntimeError("OPENAI_API_KEY ainda contém um valor de exemplo.")
+
+    client = OpenAI(api_key=key, timeout=180.0, max_retries=2)
     user_input = f"""
 VALOR ATUAL DE TABELA: R$ {table_value:,.2f}
 DATA-BASE: {base_date.strftime('%d/%m/%Y')}
-OBSERVAÇÕES DO USUÁRIO:
-{notes or 'Nenhuma observação adicional.'}
+OBSERVAÇÕES: {notes or 'Nenhuma.'}
 
-DOCUMENTOS EXTRAÍDOS:
-{documents_text}
+DOCUMENTOS:
+{doc_text[:90000]}
 """
     response = client.responses.create(
         model=model,
         instructions=MASTER_PROMPT,
         input=user_input,
+        max_output_tokens=10000,
     )
-    return response.output_text
+    report = response_text(response)
+    diagnostics = {
+        "modelo": model,
+        "response_id": getattr(response, "id", "não informado"),
+        "status": getattr(response, "status", "não informado"),
+        "caracteres_enviados": len(user_input),
+        "caracteres_recebidos": len(report),
+    }
+    if not report:
+        diagnostics["incomplete_details"] = str(
+            getattr(response, "incomplete_details", "não informado")
+        )
+        raise RuntimeError(f"A API respondeu sem texto. Diagnóstico: {diagnostics}")
+    return report, diagnostics
 
-def make_pdf(report_text: str, title: str) -> bytes:
+def make_pdf(text: str) -> bytes:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=42,
-        leftMargin=42,
-        topMargin=48,
-        bottomMargin=48,
-        title=title,
-    )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(
-        name="TitleCenter",
-        parent=styles["Title"],
-        alignment=TA_CENTER,
-        spaceAfter=18,
-        fontSize=18,
-        leading=22,
-    ))
-    styles.add(ParagraphStyle(
-        name="BodyCustom",
-        parent=styles["BodyText"],
-        fontSize=9.2,
-        leading=13,
-        spaceAfter=6,
-    ))
-    styles.add(ParagraphStyle(
-        name="HeadingCustom",
-        parent=styles["Heading2"],
-        fontSize=12,
-        leading=15,
-        spaceBefore=10,
-        spaceAfter=6,
-    ))
-
-    story = [Paragraph(title, styles["TitleCenter"]), Spacer(1, 8)]
-    lines = report_text.splitlines()
-    table_rows = []
-    in_table = False
-
-    def flush_table():
-        nonlocal table_rows, in_table
-        if table_rows:
-            normalized = []
-            max_cols = max(len(r) for r in table_rows)
-            for row in table_rows:
-                normalized.append(row + [""] * (max_cols - len(row)))
-            table = Table(normalized, repeatRows=1, hAlign="LEFT")
-            table.setStyle(TableStyle([
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                ("LEADING", (0, 0), (-1, -1), 9.5),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ]))
-            story.extend([table, Spacer(1, 8)])
-        table_rows = []
-        in_table = False
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if line.startswith("|") and line.endswith("|"):
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells):
-                continue
-            table_rows.append([Paragraph(c or " ", styles["BodyCustom"]) for c in cells])
-            in_table = True
-            continue
-        if in_table:
-            flush_table()
+    story = [Paragraph("Dossiê Executivo Imobiliário", styles["Title"]), Spacer(1, 12)]
+    for line in text.splitlines():
+        line = line.strip()
         if not line:
-            story.append(Spacer(1, 5))
-        elif line.startswith("### "):
-            story.append(Paragraph(line[4:], styles["HeadingCustom"]))
-        elif line.startswith("## "):
-            story.append(Paragraph(line[3:], styles["HeadingCustom"]))
-        elif line.startswith("# "):
-            story.append(Paragraph(line[2:], styles["HeadingCustom"]))
-        elif re.match(r"^\d+\.\s+", line):
-            story.append(Paragraph(f"<b>{line}</b>", styles["HeadingCustom"]))
-        elif line.startswith("- "):
-            story.append(Paragraph("• " + line[2:], styles["BodyCustom"]))
+            story.append(Spacer(1, 6))
+        elif line.startswith("#"):
+            story.append(Paragraph(line.lstrip("# ").strip(), styles["Heading2"]))
         else:
-            safe = (
-                line.replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-            )
-            safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
-            story.append(Paragraph(safe, styles["BodyCustom"]))
-    flush_table()
-    doc.build(story)
+            safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            story.append(Paragraph(safe, styles["BodyText"]))
+    SimpleDocTemplate(buffer, pagesize=A4).build(story)
     return buffer.getvalue()
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🏢", layout="wide")
-
 st.title("🏢 Dossiê Executivo Imobiliário")
-st.caption(
-    "Anexe contrato, aditivos e extrato; informe o valor atual de tabela; revise os dados e gere o dossiê."
+st.caption("Versão corrigida para Render, com diagnóstico de extração e resposta da API.")
+
+uploads = st.file_uploader(
+    "Contrato, aditivos, extrato e demais documentos",
+    type=["pdf", "docx", "txt", "md", "csv"],
+    accept_multiple_files=True
 )
 
-with st.sidebar:
-    st.header("Configuração")
-    st.info(
-        "A aplicação utiliza IA para interpretar os documentos. "
-        "Os cálculos e conclusões devem ser revisados antes do uso jurídico ou financeiro."
-    )
-    st.text_input(
-        "Modelo de IA",
-        value=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-        disabled=True
-    )
-
-col1, col2 = st.columns([2, 1])
-
+col1, col2 = st.columns(2)
 with col1:
-    uploads = st.file_uploader(
-        "Documentos da unidade",
-        type=["pdf", "docx", "txt", "md", "csv"],
-        accept_multiple_files=True,
-        help="Envie contrato original, todos os aditivos, extrato e documentos registrais disponíveis."
-    )
-
-with col2:
     table_value = st.number_input(
         "Valor atual de tabela (R$)",
         min_value=0.0,
-        value=0.0,
         step=1000.0,
         format="%.2f"
     )
+with col2:
     base_date = st.date_input("Data-base", value=date.today())
 
-notes = st.text_area(
-    "Observações complementares",
-    placeholder="Ex.: valor informado pelo comercial, particularidade da negociação, documento ausente..."
-)
+notes = st.text_area("Observações complementares")
 
+documents = []
 if uploads:
-    st.subheader("Arquivos selecionados")
-    preview_rows = []
-    for f in uploads:
-        preview_rows.append({
-            "Arquivo": f.name,
-            "Tamanho (KB)": round(f.size / 1024, 1),
-            "Tipo": f.type or "não identificado"
-        })
-    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+    for uploaded in uploads:
+        try:
+            documents.append(extract_file(uploaded))
+        except Exception as exc:
+            st.error(f"Erro ao ler {uploaded.name}: {exc}")
 
-process = st.button(
+if documents:
+    st.subheader("Diagnóstico dos arquivos")
+    st.dataframe(
+        [{
+            "Arquivo": d["name"],
+            "Páginas": d["pages"] or "-",
+            "Caracteres extraídos": d["chars"],
+            "Situação": "Texto localizado" if d["chars"] >= 100 else "Provável PDF escaneado"
+        } for d in documents],
+        use_container_width=True,
+        hide_index=True
+    )
+
+button = st.button(
     "Processar e gerar dossiê",
     type="primary",
     use_container_width=True,
-    disabled=not uploads or table_value <= 0
+    disabled=not documents or table_value <= 0
 )
 
-if process:
-    with st.status("Processando documentos...", expanded=True) as status:
-        try:
-            docs = []
-            for uploaded in uploads:
-                st.write(f"Extraindo: {uploaded.name}")
-                item = extract_uploaded_file(uploaded)
-                if not item["text"]:
-                    st.warning(
-                        f"Não foi possível extrair texto de {uploaded.name}. "
-                        "PDFs digitalizados podem exigir OCR."
-                    )
-                docs.append(item)
-
-            usable_docs = [d for d in docs if d["text"]]
-            if not usable_docs:
-                raise RuntimeError("Nenhum texto legível foi extraído dos documentos.")
-
-            documents_text = truncate_documents(usable_docs)
-            st.write("Analisando conteúdo contratual e financeiro...")
-            report = call_ai(
-                documents_text=documents_text,
-                table_value=table_value,
-                base_date=base_date,
-                notes=notes
+if button:
+    try:
+        usable = [d for d in documents if d["chars"] >= 100]
+        if not usable:
+            raise RuntimeError(
+                "Nenhum documento possui texto suficiente. "
+                "Os PDFs provavelmente são imagens escaneadas e precisam de OCR."
             )
-            st.session_state["report"] = report
-            st.session_state["report_meta"] = {
-                "table_value": table_value,
-                "base_date": base_date.isoformat(),
-                "files": [d["name"] for d in docs],
-            }
-            status.update(label="Dossiê concluído", state="complete", expanded=False)
-        except Exception as exc:
-            status.update(label="Falha no processamento", state="error", expanded=True)
-            st.error(str(exc))
+
+        combined = "\n\n".join(
+            f"===== {d['name']} =====\n{d['text']}" for d in usable
+        )
+        if len(combined) < 500:
+            raise RuntimeError("Texto documental insuficiente para análise.")
+
+        with st.spinner("Analisando documentos e gerando dossiê..."):
+            report, diagnostics = generate_report(
+                combined, table_value, base_date, notes
+            )
+        st.session_state["report"] = report
+        st.session_state["diagnostics"] = diagnostics
+    except Exception as exc:
+        st.error(str(exc))
+        st.info(
+            "No Render, abra Logs para conferir o erro completo. "
+            "Depois de alterar variáveis ou arquivos, use "
+            "Manual Deploy → Clear build cache & deploy."
+        )
 
 if "report" in st.session_state:
-    report = st.session_state["report"]
-    st.divider()
-    st.subheader("Dossiê gerado")
-    st.markdown(report)
+    st.success("Dossiê gerado com sucesso.")
+    st.markdown(st.session_state["report"])
 
-    pdf_bytes = make_pdf(
-        report,
-        "Dossiê Executivo de Valorização Patrimonial e Análise Contratual"
-    )
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.download_button(
-            "Baixar dossiê em PDF",
-            data=pdf_bytes,
-            file_name="dossie_executivo_imobiliario.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
-    with col_b:
-        st.download_button(
-            "Baixar memória em Markdown",
-            data=report.encode("utf-8"),
-            file_name="dossie_executivo_imobiliario.md",
-            mime="text/markdown",
-            use_container_width=True
-        )
+    with st.expander("Diagnóstico técnico"):
+        st.json(st.session_state.get("diagnostics", {}))
 
-    st.warning(
-        "Antes de apresentar o documento a cliente, diretoria, jurídico ou financeiro, "
-        "revise páginas, cláusulas, valores, datas e eventuais falhas de extração."
+    st.download_button(
+        "Baixar PDF",
+        data=make_pdf(st.session_state["report"]),
+        file_name="dossie_executivo_imobiliario.pdf",
+        mime="application/pdf",
+        use_container_width=True
     )

@@ -3,7 +3,6 @@ services:
     name: dossie-imobiliario
     runtime: docker
     plan: starter
-    autoDeploy: true
     envVars:
       - key: OPENAI_API_KEY
         sync: false
